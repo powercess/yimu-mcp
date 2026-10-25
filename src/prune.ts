@@ -2,6 +2,22 @@
 // 服务端 schema 面向 App 渲染（同步元数据 + UI 字段 + 空默认值），直接透传会浪费大量上下文；
 // 这里统一做：空值裁剪、业务字段投影、数值/日期规整、用户对象脱敏。
 
+// Node >=23.4 已支持 JSON 源文本访问；当前 TypeScript 标准库尚未声明这些 API。
+const sourceJson = JSON as typeof JSON & {
+  rawJSON(source: string): object;
+  isRawJSON(value: unknown): boolean;
+};
+
+/** 数字保留源文本，避免脱敏后重新序列化时发生精度损失或指数溢出。 */
+function parseJsonPreservingNumbers(text: string): unknown {
+  return JSON.parse(text, (_key, value: unknown, context?: { source?: string }) => {
+    if (typeof value === "number" && context?.source !== undefined) {
+      return sourceJson.rawJSON(context.source);
+    }
+    return value;
+  });
+}
+
 const CREDENTIAL_FIELD = /token|password|passwd|passphrase|secret|authorization|cookie|credential|apikey|accesskey/;
 
 /** MCP 输出的共同边界；客户端内部保留原始认证响应以完成登录和令牌更新。 */
@@ -20,7 +36,7 @@ export function sanitizeOutput(value: unknown, secrets: readonly string[] = []):
       // 有些接口把对象放在 JSON 字符串中；保持字符串类型同时清除其中的凭据字段。
       if (/^\s*[\[{]/.test(v)) {
         try {
-          const parsed: unknown = JSON.parse(v);
+          const parsed = parseJsonPreservingNumbers(v);
           const cleaned = JSON.stringify(visit(parsed));
           // 无需脱敏时保留原文，避免改写订单号等大整数以及用户的文本格式。
           if (cleaned !== JSON.stringify(parsed)) return cleaned;
@@ -28,6 +44,8 @@ export function sanitizeOutput(value: unknown, secrets: readonly string[] = []):
       }
       return redactText(v);
     }
+    // rawJSON 是本次解析产生的数字原文，不作为普通对象遍历。
+    if (sourceJson.isRawJSON(v)) return v;
     if (Array.isArray(v)) return v.map(visit);
     if (v && typeof v === "object") {
       return Object.fromEntries(Object.entries(v)

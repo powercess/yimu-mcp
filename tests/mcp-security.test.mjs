@@ -267,3 +267,18 @@ test('ordinary JSON ledger remarks preserve large integers and original formatti
   const result = decoded(await call('sync_pull', { summary: false }));
   assert.equal(result.Bill[0].remark, remark);
 });
+
+for (const [label, remark, expected] of [
+  ['credential field', '{ "orderId": 9223372036854775807, "token": "synthetic-remark-secret" }', '{"orderId":9223372036854775807}'],
+  ['known secret echo', '{ "orderId": 9223372036854775807, "note": "' + JWT + '" }', '{"orderId":9223372036854775807,"note":"[REDACTED]"}'],
+  ['numeric spellings', '{"password":"hidden","values":[-9223372036854775809,12.3400,1e400,1e-400,-0]}', '{"values":[-9223372036854775809,12.3400,1e400,1e-400,-0]}'],
+  ['nested JSON string', JSON.stringify({ nested: '{"orderId":9223372036854775807,"token":"hidden"}' }), JSON.stringify({ nested: '{"orderId":9223372036854775807}' })],
+]) {
+  test(`JSON ledger remarks preserve numeric source text while removing ${label}`, async (t) => {
+    const { call } = await connect(t, { fetchImpl: async () => json({
+      code: 0, result: { Bill: [{ billId: 123, cost: 12.34, remark }] },
+    }) });
+    const result = decoded(await call('sync_pull', { summary: false }));
+    assert.equal(result.Bill[0].remark, expected);
+  });
+}
