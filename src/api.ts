@@ -2,7 +2,7 @@
 //
 // 响应信封 {code, msg, result}（部分接口兼容 data）：
 //   code===0 成功取 result；code===1 && msg==="no data" 成功无数据（null）；code===200 同步限流成功；
-//   其余抛 YimuError(msg)。登录/扫码/查用户接口的顶层 token 自动刷新 JWT。
+//   其余抛不含服务端原文的 YimuError。登录/扫码/查用户接口的顶层 token 自动刷新 JWT。
 
 import { encryptPassword } from "./crypto.ts";
 
@@ -11,10 +11,35 @@ const USER_AGENT =
 
 /** 统一错误：HTTP 失败、业务码失败、网络异常 */
 export class YimuError extends Error {
-  constructor(message: string, cause?: unknown) {
-    super(message, { cause });
+  constructor(message: string) {
+    super(message);
     this.name = "YimuError";
   }
+}
+
+export const OFFICIAL_API_BASE_URL = "https://yimubill.com/api";
+const OFFICIAL_ORIGIN = new URL(OFFICIAL_API_BASE_URL).origin;
+
+/** 凭据只可发送到官方 HTTPS 服务，包括独立的 /bookkeeping 路径。 */
+function assertOfficialUrl(url: URL): void {
+  if (url.origin !== OFFICIAL_ORIGIN || url.username || url.password || url.hash) {
+    throw new YimuError("只允许访问一木官方 HTTPS 服务");
+  }
+}
+
+/** 保留原配置项以便迁移，但不再接受自定义服务地址。 */
+export function validateApiBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new YimuError("API 地址必须为 https://yimubill.com/api");
+  }
+  assertOfficialUrl(url);
+  if (url.pathname.replace(/\/+$/, "") !== "/api" || url.search) {
+    throw new YimuError("API 地址必须为 https://yimubill.com/api");
+  }
+  return OFFICIAL_API_BASE_URL;
 }
 
 /** 解析响应信封 → 业务结果；非成功抛 YimuError */
@@ -25,8 +50,9 @@ export function unwrapEnvelope(data: unknown): unknown {
   if (code === 0) return (d.result !== undefined ? d.result : d.data) ?? null;
   if (code === 200) return (d.result !== undefined ? d.result : d.data) ?? d; // 同步限流接口：保留 syncCount/sessionId
   if (code === 1 && d.msg === "no data") return null;
-  const msg = typeof d.msg === "string" && d.msg ? d.msg : `请求失败 (code=${String(code)})`;
-  throw new YimuError(msg);
+  // 服务端错误文本可能回显密码或令牌，不进入模型输出和启动日志。
+  const suffix = typeof code === "number" && Number.isFinite(code) ? ` (code=${code})` : "";
+  throw new YimuError(`请求失败${suffix}`);
 }
 
 /** 账单归一化（app.js Fr() 移植） */
@@ -70,9 +96,8 @@ export class YimuClient {
   userId: string;
 
   constructor(opts: YimuClientOptions) {
-    const u = new URL(opts.baseUrl);
-    this.origin = u.origin;
-    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.baseUrl = validateApiBaseUrl(opts.baseUrl);
+    this.origin = OFFICIAL_ORIGIN;
     this.token = opts.token ?? "";
     this.userToken = opts.userToken ?? "";
     this.userId = opts.userId !== undefined ? String(opts.userId) : "";
@@ -111,8 +136,14 @@ export class YimuClient {
     if (opts.params) {
       for (const [k, v] of Object.entries(opts.params)) p = p.replaceAll(`{${k}}`, String(v));
     }
-    const url = new URL(this.pathToUrl(p));
+    let url: URL;
+    try {
+      url = new URL(this.pathToUrl(p));
+    } catch {
+      throw new YimuError("接口路径无效");
+    }
     if (opts.query) for (const [k, v] of Object.entries(opts.query)) url.searchParams.set(k, String(v));
+    assertOfficialUrl(url);
 
     const headers: Record<string, string> = {
       "user-agent": USER_AGENT,
@@ -138,21 +169,20 @@ export class YimuClient {
         headers,
         body,
         signal: AbortSignal.timeout(this.timeoutMs),
-        redirect: "follow",
+        redirect: "error",
       });
-    } catch (e) {
-      throw new YimuError(`网络请求失败: ${(e as Error).message}`, e);
+    } catch {
+      // 不保留原始错误或 cause：未捕获异常也可能把它们写入 stderr。
+      throw new YimuError("网络请求失败（不允许重定向）");
     }
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new YimuError(`HTTP ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}`);
+      throw new YimuError(`HTTP ${res.status}`);
     }
     let data: unknown;
     try {
       data = await res.json();
-    } catch (e) {
-      const text = await res.text().catch(() => "");
-      throw new YimuError(`响应不是 JSON: ${text.slice(0, 200)}`, e);
+    } catch {
+      throw new YimuError("响应不是有效 JSON");
     }
     if (opts.raw) return data;
     // 登录/扫码/查用户接口的顶层 token 刷新 JWT

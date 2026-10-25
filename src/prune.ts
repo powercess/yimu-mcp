@@ -2,6 +2,45 @@
 // 服务端 schema 面向 App 渲染（同步元数据 + UI 字段 + 空默认值），直接透传会浪费大量上下文；
 // 这里统一做：空值裁剪、业务字段投影、数值/日期规整、用户对象脱敏。
 
+const CREDENTIAL_FIELD = /token|password|passwd|passphrase|secret|authorization|cookie|credential|apikey|accesskey/;
+
+/** MCP 输出的共同边界；客户端内部保留原始认证响应以完成登录和令牌更新。 */
+export function sanitizeOutput(value: unknown, secrets: readonly string[] = []): unknown {
+  const replacements = [...new Set(secrets.filter(Boolean).flatMap((secret) => {
+    const forms = [secret, JSON.stringify(secret).slice(1, -1)];
+    try { forms.push(encodeURIComponent(secret)); } catch { /* 非完整 Unicode 仍按原值脱敏 */ }
+    return forms;
+  }))].sort((a, b) => b.length - a.length);
+  const redactText = (text: string): string => {
+    for (const secret of replacements) text = text.split(secret).join("[REDACTED]");
+    return text.replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED]");
+  };
+  const visit = (v: unknown): unknown => {
+    if (typeof v === "string") {
+      // 有些接口把对象放在 JSON 字符串中；保持字符串类型同时清除其中的凭据字段。
+      if (/^\s*[\[{]/.test(v)) {
+        try {
+          const parsed: unknown = JSON.parse(v);
+          const cleaned = JSON.stringify(visit(parsed));
+          // 无需脱敏时保留原文，避免改写订单号等大整数以及用户的文本格式。
+          if (cleaned !== JSON.stringify(parsed)) return cleaned;
+        } catch { /* 普通业务文本 */ }
+      }
+      return redactText(v);
+    }
+    if (Array.isArray(v)) return v.map(visit);
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v)
+        .filter(([key, entry]) => (
+          (key === "token_set" || key === "password_configured") && typeof entry === "boolean"
+        ) || !CREDENTIAL_FIELD.test(key.toLowerCase().replace(/[^a-z0-9]/g, "")))
+        .map(([key, entry]) => [redactText(key), visit(entry)]));
+    }
+    return v;
+  };
+  return visit(value);
+}
+
 /** 递归丢弃空值：null/undefined/""/[]/{}；0/false 是业务值，保留 */
 export function prune(v: unknown): unknown {
   if (Array.isArray(v)) {

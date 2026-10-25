@@ -38,13 +38,15 @@ if (CLI.has("qr")) {
 if (!CONFIG.token && CONFIG.email && CONFIG.password) {
   try {
     await client.loginByEmail(CONFIG.email, CONFIG.password);
-    process.stderr.write(`[yimu-mcp] 已用配置账号自动登录: userId=${client.userId}\n`);
+    process.stderr.write("[yimu-mcp] 已用配置账号自动登录\n");
   } catch (e) {
     process.stderr.write(`[yimu-mcp] 自动登录失败: ${(e as Error).message}（可调 login_email/login_qr_* 重试）\n`);
   }
 }
 
-registerYimuTools(server, client, CONFIG.qrDir, { email: CONFIG.email, password: CONFIG.password });
+registerYimuTools(server, client, CONFIG.qrDir, { email: CONFIG.email, password: CONFIG.password }, {
+  enableApiRequest: CONFIG.enableApiRequest,
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

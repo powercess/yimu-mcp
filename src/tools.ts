@@ -4,8 +4,9 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { YimuClient, YimuError } from "./api.ts";
-import { renderQrPng, renderQrTerminal, saveQrPng, recognizeQrImage } from "./qr.ts";
-import { prune, projectEntity, sanitizeUser, roundMoney, fmtDate } from "./prune.ts";
+import { encryptPassword } from "./crypto.ts";
+import { renderQrPng, renderQrTerminal, saveQrPng } from "./qr.ts";
+import { prune, projectEntity, sanitizeUser, sanitizeOutput, roundMoney, fmtDate } from "./prune.ts";
 
 type Handler = (args: Record<string, unknown>) => Promise<unknown>;
 
@@ -32,7 +33,7 @@ const out = (v: unknown, opts?: { noPrune?: boolean }): { content: ContentBlock[
     return { content };
   }
   const data = opts?.noPrune ? v : prune(v);
-  return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 1) }] };
+  return { content: [{ type: "text", text: typeof data === "string" ? data : JSON.stringify(data ?? null, null, 1) }] };
 };
 
 interface PropSchema {
@@ -85,9 +86,9 @@ interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
-  /** 免鉴权工具（登录/扫码/同步会话/STS NoVerify） */
+  /** 免鉴权工具（登录/扫码/同步会话） */
   noAuth?: boolean;
-  /** 跳过输出裁剪（api_request 逃生通道原样返回） */
+  /** 跳过空值裁剪，但不能跳过凭据脱敏。 */
   noPrune?: boolean;
   handler: Handler;
 }
@@ -177,7 +178,22 @@ export function registerYimuTools(
   client: YimuClient,
   qrDir: string,
   creds: { email: string; password: string } = { email: "", password: "" },
+  options: { enableApiRequest?: boolean } = {},
 ): void {
+  // 保留本次工具进程已使用的秘密，防止令牌刷新或登录结束后的迟到回显。
+  const secrets = new Set<string>();
+  const rememberSecrets = (password = ""): void => {
+    if (client.token) secrets.add(client.token);
+    // 一木 userObjectToken 通常是公开邮箱；非邮箱形式仍作为凭据处理。
+    if (client.userToken && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(client.userToken)) secrets.add(client.userToken);
+    for (const value of [creds.password, password]) {
+      if (value) {
+        secrets.add(value);
+        secrets.add(encryptPassword(value));
+      }
+    }
+  };
+  rememberSecrets();
   const requireAuth = (args: Record<string, unknown>): void => {
     if (!client.token) {
       throw new YimuError(
@@ -238,7 +254,7 @@ export function registerYimuTools(
     {
       name: "login_qr_poll",
       description:
-        "等待/轮询扫码登录结果（免鉴权）。timeout 秒内每 3 秒查询一次，用户扫码后返回 status=success 与用户对象（JWT 已自动保存）；" +
+        "等待/轮询扫码登录结果（免鉴权）。timeout 秒内每 3 秒查询一次，用户扫码后返回 status=success 与用户对象（JWT 仅保留在当前进程内部）；" +
         "timeout=0 只查一次。默认 120 秒。",
       inputSchema: {
         type: "object",
@@ -256,7 +272,7 @@ export function registerYimuTools(
         const deadline = Date.now() + timeout * 1000;
         for (;;) {
           const user = await client.getScanLogin(sid);
-          if (user) return { status: "success", user: sanitizeUser(user), token: client.token };
+          if (user) return { status: "success", user: sanitizeUser(user) };
           if (timeout === 0 || Date.now() >= deadline) {
             return { status: "pending", hint: "等待扫码或登录尚未完成；可再次调用本工具（传 timeout 秒数则自动等待）" };
           }
@@ -267,27 +283,9 @@ export function registerYimuTools(
       },
     },
     {
-      name: "login_qr_recognize",
-      description:
-        "从 PNG 图片识别二维码内容（免鉴权，测试/自动登录链路校验用）：传入图片路径，返回二维码文本与 session_id。" +
-        "可用于验证 login_qr_start 生成的二维码文件内容是否为 login:<session_id>。",
-      inputSchema: {
-        type: "object",
-        properties: { image_path: { type: "string", description: "PNG 二维码图片文件路径" } },
-        required: ["image_path"],
-        additionalProperties: false,
-      },
-      noAuth: true,
-      handler: async (a) => {
-        const text = await recognizeQrImage(str(a.image_path));
-        const m = /^login:(.+)$/.exec(text);
-        return { text, session_id: m ? m[1] : null, is_login_qr: Boolean(m) };
-      },
-    },
-    {
       name: "login_email",
       description:
-        "邮箱密码登录（免鉴权）。密码按网页端加密方案（AES-128-ECB）加密后提交；返回用户对象与 JWT。" +
+        "邮箱密码登录（免鉴权）。密码按网页端加密方案（AES-128-ECB）加密后提交；仅返回登录状态与用户对象。" +
         "不传 email/password 时使用环境变量 YIMU_EMAIL/YIMU_PASSWORD（未配置则报错）。" +
         "请优先使用扫码登录（更安全）。",
       inputSchema: {
@@ -306,7 +304,7 @@ export function registerYimuTools(
           throw new YimuError("缺少邮箱或密码：请传 email/password 参数，或在环境变量配置 YIMU_EMAIL/YIMU_PASSWORD");
         }
         const user = await client.loginByEmail(email, password);
-        return { user: sanitizeUser(user as Record<string, unknown>), token: client.token };
+        return { status: "success", user: sanitizeUser(user as Record<string, unknown>) };
       },
     },
     {
@@ -705,32 +703,10 @@ export function registerYimuTools(
       },
     },
     {
-      name: "get_sts",
-      description: "获取对象存储临时凭证（GET /app/getSts/{userId}，返回原始响应体）。",
-      inputSchema: {
-        type: "object",
-        properties: { user_id: { type: "string" } },
-        additionalProperties: false,
-      },
-      handler: async (a) => {
-        requireAuth(a);
-        const id = uid(a);
-        if (!id) throw new YimuError("缺少用户 ID");
-        return client.getSts(id);
-      },
-    },
-    {
-      name: "get_sts_no_verify",
-      description: "获取对象存储临时凭证（免鉴权变体，GET /app/getStsNoVerify/，返回原始响应体）。",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
-      noAuth: true,
-      handler: async () => client.getStsNoVerify(),
-    },
-    {
       name: "api_request",
       description:
         "通用 API 请求（逃生通道，覆盖全部接口）。path 支持 {userId}/{bookId}/{time} 等占位符由 params 填充；" +
-        "自动携带 token 头并解包 {code,msg,result} 信封。可用路径见 README 接口清单；" +
+        "自动携带 token 头并解包 {code,msg,result} 信封；所有输出均移除凭据。可用路径见 README 接口清单；" +
         "例如：{method:POST, path:/bill/addOrUpdateBill, body:{...}}、{method:GET, path:/bill/getBillCount/{userId}, params:{userId:123}}。",
       inputSchema: {
         type: "object",
@@ -741,7 +717,7 @@ export function registerYimuTools(
           query: { type: "object", description: "查询参数" },
           body: { type: "object", description: "JSON 请求体" },
           form: { type: "object", description: "表单请求体（application/x-www-form-urlencoded）" },
-          raw: { type: "boolean", description: "true 时不套信封解包，返回原始响应体" },
+          raw: { type: "boolean", description: "true 时保留响应信封，但仍移除凭据" },
         },
         required: ["method", "path"],
         additionalProperties: false,
@@ -763,15 +739,21 @@ export function registerYimuTools(
   ];
 
   for (const t of tools) {
+    if (t.name === "api_request" && !options.enableApiRequest) continue;
     const guard = async (
       args: unknown,
     ): Promise<{ content: ContentBlock[]; isError?: boolean }> => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      rememberSecrets(str(a.password));
       try {
-        const a = (args ?? {}) as Record<string, unknown>;
         if (!t.noAuth) requireAuth(a);
-        return out(await t.handler(a), t.noPrune ? { noPrune: true } : undefined);
+        const result = await t.handler(a);
+        rememberSecrets();
+        return out(sanitizeOutput(result, [...secrets]), t.noPrune ? { noPrune: true } : undefined);
       } catch (e) {
-        return { isError: true, content: [{ type: "text", text: (e as Error).message }] };
+        rememberSecrets();
+        const message = e instanceof YimuError ? e.message : "工具调用失败，请检查输入或登录状态";
+        return { isError: true, content: [{ type: "text", text: String(sanitizeOutput(message, [...secrets])) }] };
       }
     };
     server.registerTool(
