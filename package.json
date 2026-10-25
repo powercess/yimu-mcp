@@ -1,6 +1,6 @@
 {
   "name": "@powercess/yimu-mcp",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "一木记账（yimubill.com）网络 MCP 服务器：扫码/邮箱登录、增量同步、账本/账单/资产/分类/标签/转账/借贷/报销/退款等全部网页接口的读写封装",
   "type": "module",
   "license": "MIT",
